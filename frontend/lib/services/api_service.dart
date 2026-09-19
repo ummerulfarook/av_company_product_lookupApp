@@ -40,6 +40,83 @@ class ApiService {
     }
   }
 
+  bool _isTokenExpired(String token) {
+    try {
+      final parts = token.split('.');
+      if (parts.length != 3) return true;
+      final payload = parts[1];
+      
+      // Normalize base64 URL string
+      String normalized = payload;
+      int mod = payload.length % 4;
+      if (mod > 0) {
+        normalized += '=' * (4 - mod);
+      }
+      
+      final String decoded = utf8.decode(base64Url.decode(normalized));
+      final Map<String, dynamic> claims = jsonDecode(decoded);
+      if (claims.containsKey('exp')) {
+        final int exp = claims['exp'];
+        final DateTime expTime = DateTime.fromMillisecondsSinceEpoch(exp * 1000);
+        return DateTime.now().isAfter(expTime.subtract(const Duration(minutes: 1)));
+      }
+      return true;
+    } catch (_) {
+      return true;
+    }
+  }
+
+  Future<bool> _refreshToken() async {
+    try {
+      final refresh = await storage.read(key: 'refresh_token');
+      if (refresh == null || refresh.isEmpty) return false;
+
+      final response = await http.post(
+        Uri.parse('$baseUrl/token/refresh/'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'refresh': refresh}),
+      ).timeout(const Duration(seconds: 5));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        final access = data['access'];
+        if (access != null) {
+          await storage.write(key: 'access_token', value: access);
+          if (data['refresh'] != null) {
+            await storage.write(key: 'refresh_token', value: data['refresh']);
+          }
+          return true;
+        }
+      } else if (response.statusCode == 401 || response.statusCode == 403) {
+        throw 'unauthorized';
+      }
+      return false;
+    } catch (e) {
+      if (e == 'unauthorized') {
+        rethrow;
+      }
+      return false;
+    }
+  }
+
+  Future<String?> _getValidToken() async {
+    String? token = await storage.read(key: 'access_token');
+    if (token == null) return null;
+
+    if (_isTokenExpired(token)) {
+      try {
+        final success = await _refreshToken();
+        if (success) {
+          token = await storage.read(key: 'access_token');
+        }
+      } catch (e) {
+        await logout();
+        return null;
+      }
+    }
+    return token;
+  }
+
   /// Fetches all products into the cache (hits backend only once per session).
   Future<List<Map<String, dynamic>>?> _fetchAllProducts(String token) async {
     try {
@@ -83,55 +160,29 @@ class ApiService {
     return null;
   }
 
-  /// Search products.
-  /// - Empty query  → returns the cached initial list (20 items from backend).
-  /// - Non-empty    → filters cache locally; falls back to backend only if the
-  ///                  cache is empty or the local search returns nothing.
-  Future<List<Map<String, dynamic>>?> searchProducts(String query) async {
+  Future<List<Map<String, dynamic>>?> searchProducts({String? query, String? code}) async {
     try {
-      final token = await storage.read(key: 'access_token');
+      final token = await _getValidToken();
       if (token == null) return null;
 
-      // ── Empty query: just show the cached initial list ───────────────────
-      if (query.isEmpty) {
+      final isQueryEmpty = query == null || query.trim().isEmpty;
+      final isCodeEmpty = code == null || code.trim().isEmpty;
+
+      // ── Both empty: just show the cached initial list ───────────────────
+      if (isQueryEmpty && isCodeEmpty) {
         if (_allProductsCache != null) return _allProductsCache;
         return await _fetchAllProducts(token); // first load — hits backend once
       }
 
-      // ── Non-empty query: search the cache locally first ──────────────────
-      // Make sure the cache is populated
-      if (_allProductsCache == null) {
-        await _fetchAllProducts(token);
-      }
-
-      final q = query.toLowerCase();
-
-      // 1. Check for an exact product_code match first (e.g., from QR scan)
-      final exactMatch = _allProductsCache
-          ?.where((p) => p['product_code']?.toString().toLowerCase() == q)
-          .toList();
-
-      if (exactMatch != null && exactMatch.isNotEmpty) {
-        return exactMatch;
-      }
-
-      // 2. Fall back to partial match for names or partial codes
-      final localResults = _allProductsCache
-          ?.where((p) =>
-              (p['product_code']?.toString().toLowerCase().contains(q) ??
-                  false) ||
-              (p['name']?.toString().toLowerCase().contains(q) ?? false))
-          .toList();
-
-      // If we got local hits, return immediately — no backend call needed
-      if (localResults != null && localResults.isNotEmpty) {
-        return localResults;
-      }
-
-      // Cache miss → hit the backend for a precise search
+      // Try hitting the backend first
       try {
+        final Map<String, String> queryParams = {};
+        if (!isQueryEmpty) queryParams['query'] = query.trim();
+        if (!isCodeEmpty) queryParams['code'] = code.trim();
+
+        final uri = Uri.parse('$baseUrl/products/').replace(queryParameters: queryParams);
         final response = await http.get(
-          Uri.parse('$baseUrl/products/?query=$query'),
+          uri,
           headers: {
             'Authorization': 'Bearer $token',
             'Content-Type': 'application/json',
@@ -165,10 +216,57 @@ class ApiService {
           }
         }
       } catch (e) {
-        // Precise search failed (e.g. server offline), return what we have
-        return localResults;
+        // Backend request failed (e.g. offline). Fallback to searching the local cache.
       }
-      return null;
+
+      // Offline Fallback: Check local cache
+      if (_allProductsCache == null) {
+        try {
+          final prefs = await SharedPreferences.getInstance();
+          final cachedData = prefs.getString('cached_products');
+          if (cachedData != null) {
+            final data = jsonDecode(cachedData);
+            if (data is List) {
+              _allProductsCache = List<Map<String, dynamic>>.from(data);
+            }
+          }
+        } catch (_) {}
+      }
+
+      List<Map<String, dynamic>> localResults = [];
+      if (_allProductsCache != null) {
+        if (!isCodeEmpty) {
+          final c = code.trim().toLowerCase();
+          localResults = _allProductsCache!
+              .where((p) => p['product_code']?.toString().toLowerCase().contains(c) ?? false)
+              .toList();
+          localResults.sort((a, b) {
+            final aCode = a['product_code']?.toString().toLowerCase() ?? '';
+            final bCode = b['product_code']?.toString().toLowerCase() ?? '';
+            if (aCode == c && bCode != c) return -1;
+            if (bCode == c && aCode != c) return 1;
+            if (aCode.startsWith(c) && !bCode.startsWith(c)) return -1;
+            if (bCode.startsWith(c) && !aCode.startsWith(c)) return 1;
+            return aCode.length.compareTo(bCode.length);
+          });
+        } else if (!isQueryEmpty) {
+          final q = query.trim().toLowerCase();
+          localResults = _allProductsCache!
+              .where((p) => p['name']?.toString().toLowerCase().contains(q) ?? false)
+              .toList();
+          localResults.sort((a, b) {
+            final aName = a['name']?.toString().toLowerCase() ?? '';
+            final bName = b['name']?.toString().toLowerCase() ?? '';
+            if (aName == q && bName != q) return -1;
+            if (bName == q && aName != q) return 1;
+            if (aName.startsWith(q) && !bName.startsWith(q)) return -1;
+            if (bName.startsWith(q) && !aName.startsWith(q)) return 1;
+            return aName.compareTo(bName);
+          });
+        }
+      }
+
+      return localResults;
     } catch (e) {
       return null;
     }
@@ -210,7 +308,7 @@ class ApiService {
   Future<Map<String, dynamic>?> getProfile({bool forceRefresh = false}) async {
     try {
       if (forceRefresh || _profileCache == null) {
-        final token = await storage.read(key: 'access_token');
+        final token = await _getValidToken();
         if (token == null) return null;
 
         try {
@@ -282,7 +380,7 @@ class ApiService {
 
   Future<bool> updateProfile(Map<String, dynamic> data) async {
     try {
-      final token = await storage.read(key: 'access_token');
+      final token = await _getValidToken();
       if (token == null) return false;
 
       final response = await http.patch(
@@ -305,7 +403,7 @@ class ApiService {
 
   Future<bool> updateProfilePhoto(String imagePath) async {
     try {
-      final token = await storage.read(key: 'access_token');
+      final token = await _getValidToken();
       if (token == null) return false;
 
       final request =
@@ -339,7 +437,7 @@ class ApiService {
 
   Future<void> incrementSearchCount() async {
     try {
-      final token = await storage.read(key: 'access_token');
+      final token = await _getValidToken();
       if (token == null) return;
       await http.post(
         Uri.parse('$baseUrl/profile/increment-search/'),
@@ -412,7 +510,7 @@ class ApiService {
   }
 
   Future<String?> changePassword(String oldPassword, String newPassword) async {
-    final token = await storage.read(key: 'access_token');
+    final token = await _getValidToken();
     if (token == null) return 'Not authenticated';
 
     final response = await http.post(

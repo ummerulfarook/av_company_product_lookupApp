@@ -39,13 +39,15 @@ class ProductSearchView(APIView):
         query = request.query_params.get('query')
         code = request.query_params.get('code')
         
-        search_term = query if query is not None else code
-        if search_term:
-            search_term = search_term.strip()
+        if query:
+            query = query.strip()
+        if code:
+            code = code.strip()
             
         try:
             from django.db.models import Q
             from .models import Product
+            from .mssql_client import search_products
 
             price_level = 1
             try:
@@ -53,15 +55,43 @@ class ProductSearchView(APIView):
             except Exception:
                 pass
 
+            # Python Relevance Sorting helper
+            def sort_results(res_list, code_val=None, query_val=None):
+                if code_val:
+                    c_lower = code_val.lower()
+                    def code_key(r):
+                        cd = str(r.get('product_code', '')).lower()
+                        if cd == c_lower:
+                            return (0, len(cd), cd)
+                        elif cd.startswith(c_lower):
+                            return (1, len(cd), cd)
+                        else:
+                            return (2, len(cd), cd)
+                    return sorted(res_list, key=code_key)
+                elif query_val:
+                    q_lower = query_val.lower()
+                    def name_key(r):
+                        nm = str(r.get('name', '')).lower()
+                        if nm == q_lower:
+                            return (0, len(nm), nm)
+                        elif nm.startswith(q_lower):
+                            return (1, len(nm), nm)
+                        else:
+                            return (2, len(nm), nm)
+                    return sorted(res_list, key=name_key)
+                return res_list
+
             # Check if we have local products uploaded
             if Product.objects.exists():
-                if search_term:
+                if code or query:
                     # Filter local products
-                    db_results = Product.objects.filter(
-                        Q(product_code__iexact=search_term) |
-                        Q(product_code__icontains=search_term) |
-                        Q(name__icontains=search_term)
-                    )[:100]
+                    q_obj = Q()
+                    if code:
+                        q_obj &= Q(product_code__icontains=code)
+                    if query:
+                        q_obj &= Q(name__icontains=query)
+                        
+                    db_results = Product.objects.filter(q_obj)[:100]
                 else:
                     # Return top 30
                     db_results = Product.objects.all()[:30]
@@ -92,7 +122,7 @@ class ProductSearchView(APIView):
                     })
             else:
                 # Fallback to external MSSQL database
-                raw_results = search_products(search_term)
+                raw_results = search_products(code=code, query=query) if (code or query) else search_products()
                 
                 results = []
                 for row in raw_results:
@@ -118,6 +148,10 @@ class ProductSearchView(APIView):
                         'price_3': price_3,
                         'price': price,
                     })
+                
+            # Apply sorting before returning response
+            if code or query:
+                results = sort_results(results, code_val=code, query_val=query)
                 
             return Response(results)
         except Exception as e:

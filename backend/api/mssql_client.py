@@ -113,7 +113,7 @@ def get_total_products_count():
         logger.error(f"Error fetching total products count from external MSSQL database: {e}")
         return 0
 
-def search_products(search_term=None):
+def search_products(search_term=None, code=None, query=None):
     """
     Queries the external database to find products.
     """
@@ -133,23 +133,37 @@ def search_products(search_term=None):
     try:
         with get_mssql_connection() as conn:
             with conn.cursor() as cursor:
-                if not search_term:
-                    # Return top 30 products
-                    query = f"SELECT TOP 30 * FROM ({base_query}) AS sub"
-                    cursor.execute(query)
+                if code or query:
+                    conditions = []
+                    params = []
+                    if code:
+                        conditions.append("[product code] LIKE ?")
+                        params.append(f"%{code}%")
+                    if query:
+                        conditions.append("[product name] LIKE ?")
+                        params.append(f"%{query}%")
+                    
+                    where_clause = " AND ".join(conditions)
+                    sql_query = f"SELECT TOP 100 * FROM ({base_query}) AS sub WHERE {where_clause}"
+                    cursor.execute(sql_query, params)
                     rows = cursor.fetchall()
-                else:
+                elif search_term:
                     # Check exact code match first
-                    query = f"SELECT * FROM ({base_query}) AS sub WHERE [product code] = ?"
-                    cursor.execute(query, (search_term,))
+                    sql_query = f"SELECT * FROM ({base_query}) AS sub WHERE [product code] = ?"
+                    cursor.execute(sql_query, (search_term,))
                     rows = cursor.fetchall()
                     
                     if not rows:
                         # Fallback to partial name/code matches
-                        query = f"SELECT TOP 100 * FROM ({base_query}) AS sub WHERE [product code] LIKE ? OR [product name] LIKE ?"
+                        sql_query = f"SELECT TOP 100 * FROM ({base_query}) AS sub WHERE [product code] LIKE ? OR [product name] LIKE ?"
                         like_term = f"%{search_term}%"
-                        cursor.execute(query, (like_term, like_term))
+                        cursor.execute(sql_query, (like_term, like_term))
                         rows = cursor.fetchall()
+                else:
+                    # Return top 30 products
+                    sql_query = f"SELECT TOP 30 * FROM ({base_query}) AS sub"
+                    cursor.execute(sql_query)
+                    rows = cursor.fetchall()
                 
                 # Convert pyodbc rows to dictionaries
                 columns = [col[0] for col in cursor.description]

@@ -17,7 +17,8 @@ class SearchScreen extends StatefulWidget {
 }
 
 class _SearchScreenState extends State<SearchScreen> with WidgetsBindingObserver {
-  final _searchController = TextEditingController();
+  final _nameSearchController = TextEditingController();
+  final _codeSearchController = TextEditingController();
   final ApiService _apiService = ApiService();
   bool _isSearching = false;
   bool _isCameraMode = false;
@@ -59,16 +60,17 @@ class _SearchScreenState extends State<SearchScreen> with WidgetsBindingObserver
 
   Future<void> _loadInitialProducts() async {
       setState(() { _isSearching = true; });
-    final data = await _apiService.searchProducts("");
+    final data = await _apiService.searchProducts();
     if (mounted) setState(() {
       _isSearching = false;
       _products = data;
     });
   }
 
-  Future<void> _searchProduct() async {
-    final query = _searchController.text.trim();
-    if (query.isEmpty) {
+  Future<void> _searchProduct({String? code, String? query}) async {
+    final searchCode = code ?? _codeSearchController.text.trim();
+    final searchQuery = query ?? _nameSearchController.text.trim();
+    if (searchCode.isEmpty && searchQuery.isEmpty) {
       _loadInitialProducts();
       return;
     }
@@ -77,12 +79,18 @@ class _SearchScreenState extends State<SearchScreen> with WidgetsBindingObserver
     _apiService.incrementSearchCount();
     
     setState(() { _isSearching = true; _errorMessage = null; _products = null; });
-    final data = await _apiService.searchProducts(query);
+    final data = await _apiService.searchProducts(
+      code: searchCode.isNotEmpty ? searchCode : null,
+      query: searchQuery.isNotEmpty ? searchQuery : null,
+    );
     if (mounted) {
       setState(() {
         _isSearching = false;
         if (data != null && data.isNotEmpty) { _products = data; }
-        else { _errorMessage = 'No products matched "$query".'; }
+        else {
+          final displayTerm = searchCode.isNotEmpty ? searchCode : searchQuery;
+          _errorMessage = 'No products matched "$displayTerm".';
+        }
       });
     }
   }
@@ -104,15 +112,17 @@ class _SearchScreenState extends State<SearchScreen> with WidgetsBindingObserver
     final rawValue = capture.barcodes.first.rawValue;
     if (rawValue != null && rawValue.isNotEmpty) {
       _deactivateCameraMode();
-      _searchController.text = rawValue;
-      _searchProduct();
+      _codeSearchController.text = rawValue;
+      _nameSearchController.clear();
+      _searchProduct(code: rawValue);
     }
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _searchController.dispose();
+    _nameSearchController.dispose();
+    _codeSearchController.dispose();
     _cameraController?.dispose();
     super.dispose();
   }
@@ -166,8 +176,8 @@ class _SearchScreenState extends State<SearchScreen> with WidgetsBindingObserver
 
                       if (_products != null && _products!.isNotEmpty) ...[
                         _buildSectionLabel(
-                          _searchController.text.isEmpty ? 'PRODUCTS' : 'SEARCH RESULTS', 
-                          badge: _searchController.text.isEmpty 
+                          (_nameSearchController.text.isEmpty && _codeSearchController.text.isEmpty) ? 'PRODUCTS' : 'SEARCH RESULTS', 
+                          badge: (_nameSearchController.text.isEmpty && _codeSearchController.text.isEmpty)
                               ? (_totalProductsInDb > 0 ? '$_totalProductsInDb Total' : '${_products!.length} Found')
                               : '${_products!.length} Found'
                         ),
@@ -178,7 +188,7 @@ class _SearchScreenState extends State<SearchScreen> with WidgetsBindingObserver
                           itemCount: _products!.length,
                           separatorBuilder: (context, index) => const SizedBox(height: 12),
                           itemBuilder: (context, index) {
-                            return _buildProductCard(_products![index], isSearchResult: _searchController.text.isNotEmpty, delay: index * 50);
+                            return _buildProductCard(_products![index], isSearchResult: (_nameSearchController.text.isNotEmpty || _codeSearchController.text.isNotEmpty), delay: index * 50);
                           },
                         ),
                       ],
@@ -452,64 +462,140 @@ class _SearchScreenState extends State<SearchScreen> with WidgetsBindingObserver
       );
     }
 
-    // Default text input
+    // Default text input - Split into Code and Name Search fields
     return _maybeAnimate(
-      ClipRRect(
-        borderRadius: BorderRadius.circular(16),
-        child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
-          child: Container(
-            decoration: BoxDecoration(
-              color: isDark ? Colors.white.withOpacity(0.1) : Colors.black.withOpacity(0.04),
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: isDark ? Colors.white.withOpacity(0.15) : AppTheme.lightBorder),
-              boxShadow: [BoxShadow(color: Colors.black.withOpacity(isDark ? 0.15 : 0.05), blurRadius: 20)],
-            ),
-            child: Row(children: [
-              const Padding(padding: EdgeInsets.all(16.0), child: Icon(Icons.search_rounded, color: Color(0xFFFF6B6B), size: 24)),
-              Expanded(
-                child: TextField(
-                  controller: _searchController,
-                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700, color: textColor, letterSpacing: 0.5),
-                  decoration: InputDecoration(
-                    hintText: 'Search by name or code...',
-                    hintStyle: TextStyle(color: subTextColor.withOpacity(0.45), fontSize: 17, fontWeight: FontWeight.w700),
-                    border: InputBorder.none,
-                    contentPadding: const EdgeInsets.symmetric(vertical: 18),
-                  ),
-                  onSubmitted: (_) => _searchProduct(),
+      Column(
+        children: [
+          // 1. Code Search Field
+          ClipRRect(
+            borderRadius: BorderRadius.circular(16),
+            child: BackdropFilter(
+              filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: isDark ? Colors.white.withOpacity(0.1) : Colors.black.withOpacity(0.04),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: isDark ? Colors.white.withOpacity(0.15) : AppTheme.lightBorder),
+                  boxShadow: [BoxShadow(color: Colors.black.withOpacity(isDark ? 0.15 : 0.05), blurRadius: 20)],
                 ),
-              ),
-              if (_searchController.text.isNotEmpty)
-                IconButton(
-                  icon: Icon(Icons.close_rounded, color: subTextColor, size: 20),
-                  onPressed: () {
-                    _searchController.clear();
-                    setState(() { _errorMessage = null; });
-                    _loadInitialProducts();
-                  },
-                ),
-              Material(
-                color: Colors.transparent,
-                child: InkWell(
-                  onTap: _searchProduct,
-                  borderRadius: BorderRadius.circular(12),
-                  splashColor: Colors.white.withOpacity(0.2),
-                  child: Container(
-                    margin: const EdgeInsets.all(8),
-                    padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
-                    decoration: BoxDecoration(
-                      gradient: const LinearGradient(colors: [Color(0xFF9E2016), Color(0xFFB22A1A)]),
-                      borderRadius: BorderRadius.circular(12),
-                      boxShadow: [BoxShadow(color: const Color(0xFF9E2016).withOpacity(0.5), blurRadius: 8, offset: const Offset(0, 3))],
+                child: Row(children: [
+                  const Padding(padding: EdgeInsets.all(16.0), child: Icon(Icons.tag_rounded, color: Color(0xFFFF6B6B), size: 24)),
+                  Expanded(
+                    child: TextField(
+                      controller: _codeSearchController,
+                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: textColor, letterSpacing: 0.5),
+                      decoration: InputDecoration(
+                        hintText: 'Search by code (e.g. 11)...',
+                        hintStyle: TextStyle(color: subTextColor.withOpacity(0.45), fontSize: 15, fontWeight: FontWeight.w700),
+                        border: InputBorder.none,
+                        contentPadding: const EdgeInsets.symmetric(vertical: 18),
+                      ),
+                      onChanged: (val) {
+                        if (val.isNotEmpty) {
+                          _nameSearchController.clear();
+                          setState(() {});
+                        }
+                      },
+                      onSubmitted: (_) => _searchProduct(code: _codeSearchController.text.trim()),
                     ),
-                    child: const Text('Go', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14)),
                   ),
-                ),
+                  if (_codeSearchController.text.isNotEmpty)
+                    IconButton(
+                      icon: Icon(Icons.close_rounded, color: subTextColor, size: 20),
+                      onPressed: () {
+                        _codeSearchController.clear();
+                        setState(() { _errorMessage = null; });
+                        _loadInitialProducts();
+                      },
+                    ),
+                  Material(
+                    color: Colors.transparent,
+                    child: InkWell(
+                      onTap: () => _searchProduct(code: _codeSearchController.text.trim()),
+                      borderRadius: BorderRadius.circular(12),
+                      splashColor: Colors.white.withOpacity(0.2),
+                      child: Container(
+                        margin: const EdgeInsets.all(8),
+                        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+                        decoration: BoxDecoration(
+                          gradient: const LinearGradient(colors: [Color(0xFF9E2016), Color(0xFFB22A1A)]),
+                          borderRadius: BorderRadius.circular(12),
+                          boxShadow: [BoxShadow(color: const Color(0xFF9E2016).withOpacity(0.5), blurRadius: 8, offset: const Offset(0, 3))],
+                        ),
+                        child: const Text('Go', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14)),
+                      ),
+                    ),
+                  ),
+                ]),
               ),
-            ]),
+            ),
           ),
-        ),
+          const SizedBox(height: 12),
+          // 2. Name Search Field
+          ClipRRect(
+            borderRadius: BorderRadius.circular(16),
+            child: BackdropFilter(
+              filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: isDark ? Colors.white.withOpacity(0.1) : Colors.black.withOpacity(0.04),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: isDark ? Colors.white.withOpacity(0.15) : AppTheme.lightBorder),
+                  boxShadow: [BoxShadow(color: Colors.black.withOpacity(isDark ? 0.15 : 0.05), blurRadius: 20)],
+                ),
+                child: Row(children: [
+                  const Padding(padding: EdgeInsets.all(16.0), child: Icon(Icons.abc_rounded, color: Color(0xFFFF6B6B), size: 28)),
+                  Expanded(
+                    child: TextField(
+                      controller: _nameSearchController,
+                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: textColor, letterSpacing: 0.5),
+                      decoration: InputDecoration(
+                        hintText: 'Search by name...',
+                        hintStyle: TextStyle(color: subTextColor.withOpacity(0.45), fontSize: 15, fontWeight: FontWeight.w700),
+                        border: InputBorder.none,
+                        contentPadding: const EdgeInsets.symmetric(vertical: 18),
+                      ),
+                      onChanged: (val) {
+                        if (val.isNotEmpty) {
+                          _codeSearchController.clear();
+                          setState(() {});
+                        }
+                      },
+                      onSubmitted: (_) => _searchProduct(query: _nameSearchController.text.trim()),
+                    ),
+                  ),
+                  if (_nameSearchController.text.isNotEmpty)
+                    IconButton(
+                      icon: Icon(Icons.close_rounded, color: subTextColor, size: 20),
+                      onPressed: () {
+                        _nameSearchController.clear();
+                        setState(() { _errorMessage = null; });
+                        _loadInitialProducts();
+                      },
+                    ),
+                  Material(
+                    color: Colors.transparent,
+                    child: InkWell(
+                      onTap: () => _searchProduct(query: _nameSearchController.text.trim()),
+                      borderRadius: BorderRadius.circular(12),
+                      splashColor: Colors.white.withOpacity(0.2),
+                      child: Container(
+                        margin: const EdgeInsets.all(8),
+                        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+                        decoration: BoxDecoration(
+                          gradient: const LinearGradient(colors: [Color(0xFF9E2016), Color(0xFFB22A1A)]),
+                          borderRadius: BorderRadius.circular(12),
+                          boxShadow: [BoxShadow(color: const Color(0xFF9E2016).withOpacity(0.5), blurRadius: 8, offset: const Offset(0, 3))],
+                        ),
+                        child: const Text('Go', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14)),
+                      ),
+                    ),
+                  ),
+                ]),
+              ),
+            ),
+          ),
+        ],
       ),
       slideY: 0.05,
     );
